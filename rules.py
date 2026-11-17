@@ -1,9 +1,9 @@
 """rules.py — decides the substation state. No display, no database, no network.
 
-    evaluate(...) -> Result(state, trigger)
+evaluate(...) -> Result(state, trigger)
 
-States (priority order):
-    SYSTEM_OFFLINE  no signal for more than `offline_timeout_s`
+States (priority order, requirements §4):
+    SYSTEM_OFFLINE  no signal received for more than `offline_timeout_s`
     INTERVENE_NOW   a dial reached its limit, OR two independent signals agree
     WATCH           one signal is abnormal (dial above WATCH threshold / rising too fast,
                     abnormal lamp, siren)
@@ -14,20 +14,31 @@ Signal families: "dial", "lamp", "siren". Two different families active = signal
  is exactly what we'd see if the dial were unreadable during a real incident.)
 
 A REJECTED dial or lamp is ignored: we never use a value we don't have.
+An UNCERTAIN dial keeps its measured value and is judged normally — only REJECTED
+dials (value null + "check needed") and null values are discarded.
+
+Timestamps are ISO-8601 UTC ("2026-11-20T02:14:05Z"), like everywhere in the project.
+`last_signal_ts` must be the SERVER-side receive time of the last reading (the
+`received_at` column in app.py), not the device timestamp: a drifting device clock
+or a delayed delivery must not fake an outage. Same rule the dashboard already
+applies: MAX(received_at) vs offline_timeout_s from the settings table (seed 30 s).
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-OFFLINE_TIMEOUT_S = 30                      # "N seconds" of silence
+OFFLINE_TIMEOUT_S = 30                      # settings table: offline_timeout_s (seed 30)
 ALARM_LAMP_COLORS = {"red", "orange"}       # a green lamp "on" is just "running"
 RATE_WINDOW_S = 120                         # look-back window for the rise-rate rule
 
-# Default thresholds — in the real app these come from the `instruments` table.
+# Default thresholds — in the real app these come from the `instruments` table
+# (Settings screen, GET /api/config). They mirror the seed rows in app.py
+# (SEED_INSTRUMENTS), so out-of-the-box decisions match what the screen shows:
+# oil_temp and winding_temp rise-rate 2.0/min, pressure has none (NULL = rule off).
 DEFAULT_THRESHOLDS = {
-    "oil_temp":     {"watch": 85,  "limit": 100, "max_rise_per_min": 3.0},
-    "winding_temp": {"watch": 105, "limit": 120, "max_rise_per_min": 3.0},
-    "pressure":     {"watch": 2.0, "limit": 2.5, "max_rise_per_min": 0.5},
+    "oil_temp":     {"watch": 85,  "limit": 100, "max_rise_per_min": 2.0},
+    "winding_temp": {"watch": 105, "limit": 120, "max_rise_per_min": 2.0},
+    "pressure":     {"watch": 2.0, "limit": 2.5, "max_rise_per_min": None},
 }
 
 
@@ -38,8 +49,9 @@ class Result:
 
 
 def parse_ts(ts: str) -> datetime:
-    """'2026-11-20T02:14:05Z' -> aware datetime (UTC)."""
-    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    """'2026-11-20T02:14:05Z' -> aware datetime (UTC). Naive input is read as UTC."""
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _rising_too_fast(dial_id, value, now, history, max_rate):
@@ -55,8 +67,10 @@ def _rising_too_fast(dial_id, value, now, history, max_rate):
         return False
     t0, v0 = min(points, key=lambda p: p[0])                 # oldest point in the window
     minutes = (now - t0).total_seconds() / 60
-    # Need at least 20 s of data, otherwise sensor noise looks like a spike
-    return minutes >= 1 / 3 and (value - v0) / minutes > max_rate
+    # Need at least 1 min of span: over a few seconds, ordinary sensor noise looks
+    # like a fast rise (verified against the simulator's noise — a 20 s guard was
+    # not enough and produced spurious WATCH flickers in the NORMAL scenario).
+    return minutes >= 1 and (value - v0) / minutes > max_rate
 
 
 def evaluate(dials, lamps, siren, last_signal_ts, now=None,
@@ -64,7 +78,8 @@ def evaluate(dials, lamps, siren, last_signal_ts, now=None,
     """
     dials / lamps : lists from the latest reading (format of section 5)
     siren         : {"detected": bool, "confidence": float}
-    last_signal_ts: ISO string (or datetime) of the last signal received; None = never
+    last_signal_ts: ISO string (or datetime) of the last signal RECEIVED by the
+                    server (received_at); None = never
     now           : defaults to current UTC time (inject it in tests)
     thresholds    : {dial_id: {"watch", "limit", "max_rise_per_min"}}
     history       : {dial_id: [(datetime, value), ...]} for the rise-rate rule (optional)
@@ -122,7 +137,11 @@ if __name__ == "__main__":
     dial = lambda v, s="OK": {"dial_id": "oil_temp", "value": v, "status": s}
     red = lambda on: {"lamp_id": "alarm_red", "state": "on" if on else "off",
                       "color": "red" if on else None, "status": "OK"}
+    orange = lambda on: {"lamp_id": "alarm_orange", "state": "on" if on else "off",
+                         "color": "orange" if on else None, "status": "OK"}
     quiet, loud = {"detected": False}, {"detected": True}
+    # one past point: oil_temp was 70.0 one minute ago -> rise rate in units/min
+    HIST = {"oil_temp": [(NOW - timedelta(seconds=60), 70.0)]}
 
     cases = [
         ("normal",                     [dial(70)],            [red(0)], quiet, FRESH, "NORMAL"),
@@ -133,7 +152,12 @@ if __name__ == "__main__":
         ("rejected dial is ignored",   [dial(None, "REJECTED")], [red(0)], quiet, FRESH, "NORMAL"),
         ("silent for 60 s",            [dial(70)],            [red(0)], quiet, "2026-11-20T01:59:00Z", "SYSTEM_OFFLINE"),
         ("never received",             [],                    [],       quiet, None,  "SYSTEM_OFFLINE"),
+        # ── added with the compliance pass ──
+        ("orange lamp alone",          [dial(70)],            [orange(1)], quiet, FRESH, "WATCH"),
+        ("rising too fast",            [dial(78)],            [red(0)], quiet, FRESH, "WATCH"),
+        ("slow rise is fine",          [dial(71.5)],          [red(0)], quiet, FRESH, "NORMAL"),
+        ("rejected dial, lamp+siren",  [dial(None, "REJECTED")], [red(1)], loud,  FRESH, "INTERVENE_NOW"),
     ]
     for name, d, l, s, ts, expected in cases:
-        got = evaluate(d, l, s, ts, now=NOW).state
+        got = evaluate(d, l, s, ts, now=NOW, history=HIST).state
         print(f"{'OK  ' if got == expected else 'FAIL'} {name:28} -> {got}")
