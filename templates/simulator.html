@@ -30,6 +30,7 @@
   .tag { font-size:11px; padding:1px 7px; border-radius:6px; background:var(--grey); margin-left:6px; }
   .tag.OK { background:var(--green); } .tag.UNCERTAIN { background:var(--yellow); } .tag.REJECTED { background:var(--red); }
   .banner { padding:10px; border-radius:8px; text-align:center; font-weight:700; margin-bottom:10px; }
+  .banner.warn { background:var(--yellow); color:#111; }
   .NORMAL { background:var(--green); } .WATCH { background:var(--yellow); color:#111; }
   .INTERVENE_NOW { background:var(--red); } .SYSTEM_OFFLINE { background:var(--grey); }
   #events { max-height:280px; overflow:auto; font:13px/1.5 ui-monospace,monospace; }
@@ -43,6 +44,8 @@
   <span class="pill" id="api">API: …</span>
   <span class="pill" id="demo" hidden>DEMO RUNNING</span>
 </h1>
+<div class="banner" id="apierr" style="background:var(--red)" hidden></div>
+<div class="banner warn" id="loopwarn" hidden></div>
 
 <div class="grid">
   <div class="card">
@@ -54,6 +57,10 @@
     </div>
     <div class="row">
       <label><input type="checkbox" id="send" onchange="api('/mode',{send_to_api:this.checked})"> Send to API</label>
+    </div>
+    <div class="row">
+      <button onclick="selftest()">Send one test reading now</button>
+      <span id="st" class="muted"></span>
     </div>
     <p class="muted">Clicking a scenario cancels a running demo. “silent” stops all readings, so the dashboard should go SYSTEM_OFFLINE after its timeout.</p>
   </div>
@@ -116,6 +123,11 @@ async function sendReplies() {
   $('#msg').textContent = r.status === 200 ? ' sent ✓' : ' ' + (r.data.error || 'error');
   setTimeout(() => $('#msg').textContent = '', 3000);
 }
+async function selftest() {
+  const r = await api('/selftest');
+  $('#st').textContent = (r.data.ok ? '✓ ' : '✗ ') + (r.data.detail || 'HTTP ' + r.status);
+  setTimeout(() => $('#st').textContent = '', 10000);
+}
 
 SCENARIOS.forEach(name => {
   const b = document.createElement('button');
@@ -130,9 +142,29 @@ async function refresh() {
   document.querySelectorAll('#scenarios button').forEach(b =>
     b.classList.toggle('active', b.dataset.name === s.scenario));
   const pill = $('#api');
+  const n = s.sent || {readings: 0, alerts: 0, failed: 0};
   pill.textContent = !s.send_to_api ? 'Standalone (not sending)'
-    : 'API: ' + (s.api_ok === null ? 'no call yet' : s.api_ok ? 'connected' : 'unreachable') + ' · ' + s.api_url;
-  pill.className = 'pill ' + (!s.send_to_api ? '' : s.api_ok ? 'ok' : s.api_ok === false ? 'bad' : '');
+    : `API: ${s.api_ok === null ? 'no call yet' : s.api_ok ? 'connected' : 'unreachable'} · ${s.api_url}`
+      + ` · ${n.readings} readings · ${n.alerts} alerts sent · ${n.failed} failed`;
+  pill.className = 'pill ' + (!s.send_to_api ? ''
+    : s.api_ok === false || s.last_error ? 'bad' : s.api_ok ? 'ok' : '');
+  pill.title = s.last_error || '';
+  const errbox = $('#apierr');
+  errbox.hidden = !s.last_error;
+  errbox.textContent = 'API problem: ' + s.last_error;
+  const lw = $('#loopwarn');
+  if (s.scenario === 'silent') {
+    lw.hidden = false;
+    lw.textContent = 'Scenario "silent" — the box stops talking on purpose (no readings are sent).';
+  } else if (!s.last_reading) {
+    lw.hidden = false;
+    lw.textContent = 'No reading produced yet — if this stays up, the reading loop is not running. Start with: python simulator.py';
+  } else {
+    const age = (Date.now() - new Date(s.last_reading.timestamp).getTime()) / 1000;
+    lw.hidden = age < 15;
+    if (!lw.hidden) lw.textContent = 'No reading produced for ' + Math.round(age) +
+      ' s — the reading loop is not running. Restart with: python simulator.py';
+  }
   $('#send').checked = s.send_to_api;
   $('#demo').hidden = !s.demo;
   $('#lastAlert').textContent = s.last_alert_id || 'none';
@@ -155,7 +187,9 @@ async function refresh() {
   if (s.alerts.length) $('#alerts').replaceChildren(...s.alerts.map(a => {
     const d = document.createElement('div'); d.className = 'dial'; d.style.display = 'block';
     const replies = a.responses.map(x => `${x.role}: ${x.reply} (${x.replied_at.slice(11,19)})`).join(' → ') || 'no reply yet';
-    d.textContent = `${a.alert_id} · ${a.level} · ${a.created_at.slice(11,19)} — ${a.trigger} — ${replies}`;
+    const mark = a.delivered === false ? ' — NOT STORED BY API' : a.delivered === null ? ' (not sent — standalone)' : '';
+    d.textContent = `${a.alert_id} · ${a.level} · ${a.created_at.slice(11,19)} — ${a.trigger} — ${replies}${mark}`;
+    if (a.delivered === false) d.style.color = 'var(--red)';
     return d;
   }));
   $('#events').replaceChildren(...s.events.map(e => {

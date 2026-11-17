@@ -14,7 +14,13 @@ and replies stay in memory and are visible on the control page. Tick "Send to AP
     python simulator.py demo         # auto-play the full demo
     python simulator.py drift        # start directly in a scenario
 
-Env vars: API_URL (e.g. http://localhost:8000) · SIM_PORT (5001) · ALERT_START (1)
+Env vars: API_URL (e.g. http://localhost:8080) · SIM_PORT (5001) · ALERT_START (1)
+
+Run exactly ONE dashboard API on the port (api.py — renamed app.py in our repo is
+the same file). The old FastAPI draft (tsy.py) must NOT be running instead: it
+serves /readings instead of /api/readings and rejects every reading (value null /
+color null -> HTTP 422), so the readings table would stay empty while the control
+page still looks fine.
 
 No locks on purpose: every shared value is a single dict/list operation (atomic
 under CPython's GIL), which is fine for a test tool.
@@ -31,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 from flask import Flask, jsonify, render_template, request
 
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+API_URL = os.getenv("API_URL", "http://localhost:8080")
 PORT = int(os.getenv("SIM_PORT", 5001))
 SITE_ID = "site-01"
 INTERVAL = (2, 5)                    # seconds between readings
@@ -57,6 +63,8 @@ state = {
     "demo": False,
     "send_to_api": bool(os.getenv("API_URL")),   # False = standalone, nothing leaves here
     "api_ok": None,                              # None = no call yet
+    "sent": {"readings": 0, "alerts": 0, "failed": 0},   # what the API actually accepted
+    "last_error": None,                          # stays until the API works again
     "alerts": [],                                # local copies, newest last
     "last_reading": None,
     "last_alert_id": None,
@@ -78,21 +86,29 @@ def log(msg):
     print(f"[{now_iso()}] {msg}", flush=True)
 
 
-def post(path, payload):
-    """Forward to the API when sending is on; log only on status change."""
-    if not state["send_to_api"]:
+def error(msg):
+    """A failed API call: counted and shown on the control page until it works again."""
+    state["sent"]["failed"] += 1
+    state["last_error"] = msg
+    log(msg)
+
+
+def post(path, payload, force=False):
+    """Forward to the API when sending is on; every failure is recorded."""
+    if not state["send_to_api"] and not force:
         return True                              # standalone: pretend it went fine
     try:
         r = requests.post(API_URL + path, json=payload, timeout=3)
         ok = r.status_code < 300
-        if not ok:
-            log(f"API {path} -> HTTP {r.status_code}")
+        if not ok:                               # 404 / 422 / 500 — the payload was NOT stored
+            error(f"API {path} -> HTTP {r.status_code}: {r.text.strip()[:120]}")
     except requests.RequestException as e:
         ok = False
         if state["api_ok"] is not False:
-            log(f"API unreachable ({e.__class__.__name__})")
+            error(f"API unreachable ({e.__class__.__name__}) — is api.py running on {API_URL}?")
     if ok and state["api_ok"] is False:
         log("API reachable again")
+        state["last_error"] = None
     state["api_ok"] = ok
     return ok
 
@@ -142,7 +158,8 @@ def build_reading():
 
 def send_reading():
     reading = build_reading()
-    post("/api/readings", reading)
+    if post("/api/readings", reading) and state["send_to_api"]:
+        state["sent"]["readings"] += 1
     state["last_reading"] = reading              # shown even if the API is unreachable
 
     if state["alerted"]:                         # one alert per scenario, on the first
@@ -169,11 +186,15 @@ def create_alert(level, trigger):
              "recipients": [{"name": r.capitalize(), "role": r, "notified_at": now_iso(1)}
                             for r in ROLES_BY_LEVEL[level]],
              "responses": [], "outcome": None}
-    post("/api/alerts", alert)
+    ok = post("/api/alerts", alert)
+    alert["delivered"] = ok if state["send_to_api"] else None   # None = standalone
+    if ok and alert["delivered"]:
+        state["sent"]["alerts"] += 1
     state["last_alert_id"] = alert_id
     state["alerts"].append(alert)
     del state["alerts"][:-30]
-    log(f"Alert {alert_id} ({level}): {trigger}")
+    log(f"Alert {alert_id} ({level}): {trigger}" +
+        ("" if alert["delivered"] else "  — NOT stored by the API, see the red banner"))
     return alert_id
 
 
@@ -257,6 +278,7 @@ def index():
 def get_state():
     return jsonify(scenario=state["scenario"], demo=state["demo"],
                    send_to_api=state["send_to_api"], api_ok=state["api_ok"], api_url=API_URL,
+                   sent=state["sent"], last_error=state["last_error"],
                    last_reading=state["last_reading"], last_alert_id=state["last_alert_id"],
                    alerts=state["alerts"][::-1], events=state["events"][-40:][::-1])
 
@@ -279,6 +301,22 @@ def post_mode():
     state["api_ok"] = None
     log(f"Sending to API: {'ON -> ' + API_URL if on else 'OFF (standalone)'}")
     return jsonify(ok=True)
+
+
+@app.post("/selftest")
+def selftest():
+    """Send ONE reading to the API right now, whatever the tick says. This splits
+    the two possible failures: an API problem (the error is shown on the page) vs
+    a dead reading loop (this works but the 'sent' counters never move)."""
+    ok = post("/api/readings", build_reading(), force=True)
+    if ok:
+        state["sent"]["readings"] += 1
+        try:
+            db_path = requests.get(API_URL + "/api/state", timeout=3).json().get("db_path")
+        except requests.RequestException:
+            db_path = None
+        return jsonify(ok=True, detail="stored · db: " + (db_path or API_URL))
+    return jsonify(ok=False, detail=state["last_error"] or "failed (see event log)"), 502
 
 
 @app.post("/demo")
