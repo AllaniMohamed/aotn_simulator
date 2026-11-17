@@ -250,7 +250,6 @@ def cors(resp):
 
 # ── readings ─────────────────────────────────────────────────────────────
 @app.post("/api/readings")
-@app.post("/readings")
 def receive_reading():
     r = body()
     if r is None:
@@ -285,7 +284,6 @@ def receive_reading():
 
 
 @app.get("/api/readings")
-@app.get("/readings")
 def list_readings():
     limit = clamp(request.args.get("limit", 20, type=int) or 20, 1, 500)
     db = get_db()
@@ -316,7 +314,6 @@ def list_readings():
 
 
 @app.get("/api/state")
-@app.get("/state")
 def overall_state():
     """Last reported state, or SYSTEM_OFFLINE when no signal arrived within the timeout."""
     db = get_db()
