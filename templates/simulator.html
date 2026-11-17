@@ -3,13 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>Nadhir · Simulator control</title>
 <style>
   :root { --bg:#0f1419; --card:#1a2129; --line:#2b3641; --text:#e6edf3; --muted:#8b98a5;
           --green:#2ea043; --yellow:#d29922; --red:#da3633; --grey:#6e7681; --blue:#388bfd; }
   * { box-sizing:border-box; }
-  body { margin:0; font:15px/1.4 system-ui,sans-serif; background:var(--bg); color:var(--text); padding:16px;
-         max-width:1000px; margin-inline:auto; }
+  body { margin:16px auto; max-width:1000px; padding:0 16px; font:15px/1.4 system-ui,sans-serif;
+         background:var(--bg); color:var(--text); }
   h1 { font-size:18px; margin:0 0 12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:0 0 10px; }
   .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); }
@@ -116,10 +117,9 @@ async function sendReplies() {
   setTimeout(() => $('#msg').textContent = '', 3000);
 }
 
-// buttons are built once, then only their "active" class changes
-SCENARIOS.forEach(n => {
+SCENARIOS.forEach(name => {
   const b = document.createElement('button');
-  b.textContent = n; b.dataset.name = n; b.onclick = () => setScenario(n);
+  b.textContent = name; b.dataset.name = name; b.onclick = () => setScenario(name);
   $('#scenarios').appendChild(b);
 });
 

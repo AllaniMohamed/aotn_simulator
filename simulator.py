@@ -1,26 +1,26 @@
-"""simulator.py — fake Nadhir box + control panel.
+"""simulator.py — fake Nadhir box + control panel (simplified).
 
-Runs a small Flask server (control page on http://localhost:5001) and a background
-thread that POSTs a reading to the dashboard's API every 2–5 s, in the exact
-format of section 5 of the requirements.
+Runs a Flask control page (http://localhost:5001) plus a background thread that
+builds one section-5 reading every 2–5 s. Standalone by default: readings, alerts
+and replies stay in memory and are visible on the control page. Tick "Send to API"
+(or set API_URL) to forward everything to the dashboard API:
 
-    pip install flask requests
-    python simulator.py              # start in the "normal" scenario
-    python simulator.py demo         # auto-play the full demo (see run_demo)
-    python simulator.py drift        # start directly in a scenario
-
-STANDALONE BY DEFAULT: nothing is sent anywhere. Readings, alerts and replies stay in
-memory and are visible on the control page. To forward them to the dashboard's API,
-set API_URL (or tick "Send to API" on the control page).
-
-Env vars:  API_URL (enables sending; e.g. http://localhost:8000)   SIM_PORT (5001)   ALERT_START (1)
-
-The API routes it calls when sending is on (rename them below if yours differ):
     POST {API_URL}/api/readings
     POST {API_URL}/api/alerts
     POST {API_URL}/api/alerts/<alert_id>/responses
+
+    pip install flask requests
+    python simulator.py              # normal scenario, standalone
+    python simulator.py demo         # auto-play the full demo
+    python simulator.py drift        # start directly in a scenario
+
+Env vars: API_URL (e.g. http://localhost:8000) · SIM_PORT (5001) · ALERT_START (1)
+
+No locks on purpose: every shared value is a single dict/list operation (atomic
+under CPython's GIL), which is fine for a test tool.
 """
 
+import itertools
 import os
 import random
 import sys
@@ -32,250 +32,181 @@ import requests
 from flask import Flask, jsonify, render_template, request
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
-SEND_BY_DEFAULT = bool(os.getenv("API_URL"))      # no API_URL -> standalone
 PORT = int(os.getenv("SIM_PORT", 5001))
 SITE_ID = "site-01"
-INTERVAL = (2, 5)                           # seconds between readings
+INTERVAL = (2, 5)                    # seconds between readings
 
-# Dials: base value, noise (std-dev), WATCH and limit thresholds
+# base value, noise (std-dev), WATCH and limit thresholds
 DIALS = {
     "oil_temp":     {"unit": "°C",  "base": 70.0, "noise": 0.6,  "watch": 85,  "limit": 100},
     "winding_temp": {"unit": "°C",  "base": 82.0, "noise": 0.8,  "watch": 105, "limit": 120},
     "pressure":     {"unit": "bar", "base": 1.2,  "noise": 0.03, "watch": 2.0, "limit": 2.5},
 }
 SCENARIOS = ["normal", "drift", "limit", "unreadable", "silent"]
-ROLES_BY_LEVEL = {
-    "WATCH": ["electrician"],
-    "INTERVENE_NOW": ["electrician", "guard"],
-    "SYSTEM_OFFLINE": ["electrician"],
-}
-NAMES = {"electrician": "Electrician", "guard": "Guard"}
-GUARD_REPLIES = {"1", "2"}
-ELEC_REPLIES = {"COMING", "WATCH", "FALSE ALARM"}
+ROLES_BY_LEVEL = {"WATCH": ["electrician"],
+                  "INTERVENE_NOW": ["electrician", "guard"],
+                  "SYSTEM_OFFLINE": ["electrician"]}
+GUARD_REPLIES = ("1", "2")
+ELEC_REPLIES = ("COMING", "WATCH", "FALSE ALARM")
 
 app = Flask(__name__)
-lock = threading.RLock()
 stop_demo = threading.Event()
+ALERT_SEQ = itertools.count(int(os.getenv("ALERT_START", 1)))   # thread-safe IDs
 state = {
     "scenario": "normal",
     "demo": False,
-    "send_to_api": SEND_BY_DEFAULT,         # False = standalone, nothing leaves this process
-    "api_ok": None,                         # None = no call yet
-    "alerts": [],                           # local copy of alerts + replies (newest last)
+    "send_to_api": bool(os.getenv("API_URL")),   # False = standalone, nothing leaves here
+    "api_ok": None,                              # None = no call yet
+    "alerts": [],                                # local copies, newest last
     "last_reading": None,
     "last_alert_id": None,
-    "alerted": False,                       # alert already sent for the current scenario?
-    "oil_drift": DIALS["oil_temp"]["base"],
-    "alert_seq": int(os.getenv("ALERT_START", 1)),
+    "alerted": False,                            # alert already sent for this scenario?
+    "drift_value": DIALS["oil_temp"]["base"],
     "events": [],
 }
 
 
-# ───────────── helpers ─────────────
+# ── helpers ──────────────────────────────────────────────────────────────
 def now_iso(offset_s=0):
     t = datetime.now(timezone.utc) + timedelta(seconds=offset_s)
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def log(msg):
-    with lock:
-        state["events"].append({"t": now_iso(), "msg": msg})
-        del state["events"][:-100]
-    print(f"[{now_iso()}] {msg}")
+    state["events"].append({"t": now_iso(), "msg": msg})
+    del state["events"][:-100]
+    print(f"[{now_iso()}] {msg}", flush=True)
 
 
 def post(path, payload):
-    """POST to the API (only if enabled); log only when the connection status changes."""
+    """Forward to the API when sending is on; log only on status change."""
     if not state["send_to_api"]:
-        return True                                  # standalone: pretend it went fine
+        return True                              # standalone: pretend it went fine
     try:
         r = requests.post(API_URL + path, json=payload, timeout=3)
         ok = r.status_code < 300
         if not ok:
-            log(f"API {path} -> HTTP {r.status_code}: {r.text[:120]}")
+            log(f"API {path} -> HTTP {r.status_code}")
     except requests.RequestException as e:
         ok = False
         if state["api_ok"] is not False:
             log(f"API unreachable ({e.__class__.__name__})")
-    with lock:
-        if ok and state["api_ok"] is False:
-            log("API reachable again")
-        state["api_ok"] = ok
+    if ok and state["api_ok"] is False:
+        log("API reachable again")
+    state["api_ok"] = ok
     return ok
 
 
-# ───────────── readings ─────────────
-def noisy(d, value=None):
-    return round((d["base"] if value is None else value) + random.gauss(0, d["noise"]), 2)
+# ── readings ─────────────────────────────────────────────────────────────
+def noisy(dial, value=None):
+    return round((dial["base"] if value is None else value) + random.gauss(0, dial["noise"]), 2)
 
 
 def build_reading():
-    """Build one reading for the current scenario."""
+    """One reading in the exact section-5 format, for the current scenario."""
     sc = state["scenario"]
     values = {k: noisy(d) for k, d in DIALS.items()}
-    red = False
-    siren = False
-    sys_state = "NORMAL"
+    red, siren, sys_state = False, False, "NORMAL"
 
     if sc == "drift":
-        watch = DIALS["oil_temp"]["watch"]
-        state["oil_drift"] = min(state["oil_drift"] + random.uniform(1.0, 2.0), watch + 1.5)
-        values["oil_temp"] = round(state["oil_drift"] + random.gauss(0, 0.15), 2)
-        if values["oil_temp"] >= watch:
+        state["drift_value"] = min(state["drift_value"] + random.uniform(1.0, 2.0),
+                                   DIALS["oil_temp"]["watch"] + 1.5)
+        values["oil_temp"] = round(state["drift_value"] + random.gauss(0, 0.15), 2)
+        if values["oil_temp"] >= DIALS["oil_temp"]["watch"]:
             sys_state = "WATCH"
     elif sc == "limit":
         values["oil_temp"] = noisy(DIALS["oil_temp"], DIALS["oil_temp"]["limit"] + 5)
         red, siren, sys_state = True, True, "INTERVENE_NOW"
 
-    dials = []
-    for dial_id, v in values.items():
-        d = DIALS[dial_id]
-        item = {"dial_id": dial_id, "value": v, "unit": d["unit"],
-                "confidence": round(random.uniform(0.80, 0.97), 2), "status": "OK", "message": ""}
-        if sc == "unreadable" and dial_id == "winding_temp":
-            item.update(value=None, confidence=round(random.uniform(0.05, 0.25), 2),
-                        status="REJECTED", message="check needed")
-        elif sc == "normal" and random.random() < 0.03:     # rare low-confidence read
-            item.update(confidence=round(random.uniform(0.45, 0.6), 2), status="UNCERTAIN")
-        dials.append(item)
+    dials = [{"dial_id": dial_id, "value": v, "unit": DIALS[dial_id]["unit"],
+              "confidence": round(random.uniform(0.80, 0.97), 2), "status": "OK", "message": ""}
+             for dial_id, v in values.items()]
+    if sc == "unreadable":                       # never an invented value
+        next(d for d in dials if d["dial_id"] == "winding_temp").update(
+            value=None, confidence=round(random.uniform(0.05, 0.25), 2),
+            status="REJECTED", message="check needed")
+    elif sc == "normal" and random.random() < 0.03:      # rare low-confidence read
+        dials[0].update(confidence=round(random.uniform(0.45, 0.60), 2), status="UNCERTAIN")
 
     def lamp(lamp_id, color, on):
-        return {"lamp_id": lamp_id, "state": "on" if on else "off",
-                "color": color if on else None,
+        return {"lamp_id": lamp_id, "state": "on" if on else "off", "color": color if on else None,
                 "confidence": round(random.uniform(0.85, 0.98), 2), "status": "OK"}
 
-    return {
-        "timestamp": now_iso(),
-        "site_id": SITE_ID,
-        "dials": dials,
-        "lamps": [lamp("alarm_red", "red", red),
-                  lamp("alarm_orange", "orange", False),
-                  lamp("run_green", "green", not red)],
-        "siren": {"detected": siren, "confidence": round(random.uniform(0.90, 0.99), 2)},
-        "system_state": sys_state,
-    }
-
-
-# ───────────── alerts and replies ─────────────
-def create_alert(level, trigger):
-    with lock:
-        alert_id = f"A-{state['alert_seq']:04d}"
-        state["alert_seq"] += 1
-    payload = {
-        "alert_id": alert_id,
-        "level": level,
-        "created_at": now_iso(),
-        "trigger": trigger,
-        "recipients": [{"name": NAMES[r], "role": r, "notified_at": now_iso(1)}
-                       for r in ROLES_BY_LEVEL[level]],
-        "responses": [],
-        "outcome": None,
-    }
-    post("/api/alerts", payload)
-    with lock:
-        state["last_alert_id"] = alert_id
-        state["alerts"].append(payload)
-        del state["alerts"][:-30]
-    log(f"Alert {alert_id} created ({level}): {trigger}")
-    return alert_id
-
-
-def send_replies(guard, electrician, guard_delay, elec_delay):
-    """Send replies to the last alert, each after its own delay (seconds)."""
-    alert_id = state["last_alert_id"]
-    if not alert_id:
-        return False
-    plan = sorted([("guard", guard, guard_delay), ("electrician", electrician, elec_delay)],
-                  key=lambda x: x[2])
-
-    def run():
-        t0 = time.time()
-        for role, reply, delay in plan:
-            if not reply:
-                continue
-            time.sleep(max(0, delay - (time.time() - t0)))
-            resp = {"role": role, "reply": reply, "replied_at": now_iso()}
-            post(f"/api/alerts/{alert_id}/responses", resp)
-            with lock:
-                for a in state["alerts"]:
-                    if a["alert_id"] == alert_id:
-                        a["responses"].append(resp)
-            log(f"{alert_id}: {role} replied '{reply}'")
-
-    threading.Thread(target=run, daemon=True).start()
-    return True
-
-
-# ───────────── scenarios and demo ─────────────
-def set_scenario(name):
-    with lock:
-        state["scenario"] = name
-        state["alerted"] = False
-        if name != "drift":
-            state["oil_drift"] = DIALS["oil_temp"]["base"]
-    log(f"Scenario -> {name}")
+    return {"timestamp": now_iso(), "site_id": SITE_ID, "dials": dials,
+            "lamps": [lamp("alarm_red", "red", red),
+                      lamp("alarm_orange", "orange", False),
+                      lamp("run_green", "green", not red)],
+            "siren": {"detected": siren, "confidence": round(random.uniform(0.90, 0.99), 2)},
+            "system_state": sys_state}
 
 
 def send_reading():
     reading = build_reading()
-    if post("/api/readings", reading):
-        with lock:
-            state["last_reading"] = reading
-    else:
-        with lock:
-            state["last_reading"] = reading          # still show it in the control page
+    post("/api/readings", reading)
+    state["last_reading"] = reading              # shown even if the API is unreachable
 
-    # Alert once per scenario, after the first reading that justifies it
-    with lock:
-        sc, alerted = state["scenario"], state["alerted"]
-    if not alerted and sc in ("drift", "limit"):
-        if sc == "limit":
-            create_alert("INTERVENE_NOW", "oil_temp above limit + alarm_red lit + siren detected")
-            with lock:
-                state["alerted"] = True
-        elif reading["system_state"] == "WATCH":
-            create_alert("WATCH", "oil_temp above watch threshold")
-            with lock:
-                state["alerted"] = True
+    if state["alerted"]:                         # one alert per scenario, on the first
+        return                                   # reading that justifies it
+    if state["scenario"] == "limit":
+        create_alert("INTERVENE_NOW", "oil_temp above limit + alarm_red lit + siren detected")
+        state["alerted"] = True
+    elif state["scenario"] == "drift" and reading["system_state"] == "WATCH":
+        create_alert("WATCH", "oil_temp above watch threshold")
+        state["alerted"] = True
 
 
 def reading_loop():
     while True:
-        if state["scenario"] != "silent":            # "silent" = the box stops talking
+        if state["scenario"] != "silent":        # "silent" = the box stops talking
             send_reading()
         time.sleep(random.uniform(*INTERVAL))
 
 
-def run_demo():
-    """Full walkthrough from the Overview & Demo Guide, no manual action needed."""
-    def wait(seconds):                               # True if the demo was stopped
-        return stop_demo.wait(seconds)
+# ── alerts and replies ───────────────────────────────────────────────────
+def create_alert(level, trigger):
+    alert_id = f"A-{next(ALERT_SEQ):04d}"
+    alert = {"alert_id": alert_id, "level": level, "created_at": now_iso(), "trigger": trigger,
+             "recipients": [{"name": r.capitalize(), "role": r, "notified_at": now_iso(1)}
+                            for r in ROLES_BY_LEVEL[level]],
+             "responses": [], "outcome": None}
+    post("/api/alerts", alert)
+    state["last_alert_id"] = alert_id
+    state["alerts"].append(alert)
+    del state["alerts"][:-30]
+    log(f"Alert {alert_id} ({level}): {trigger}")
+    return alert_id
 
-    with lock:
-        state["demo"] = True
-    log("Demo started")
-    try:
-        set_scenario("normal")
-        if wait(20): return                          # green banner
-        set_scenario("drift")
-        if wait(50): return                          # temperature climbs -> WATCH
-        set_scenario("limit")                        # red lamp + siren -> INTERVENE_NOW
-        while not state["alerted"]:
-            if wait(0.5): return
-        send_replies("1", "COMING", 6, 18)           # guard "1", then electrician "COMING"
-        if wait(30): return
-        set_scenario("unreadable")                   # "check needed"
-        if wait(20): return
-        set_scenario("normal")
-        if wait(10): return
-        set_scenario("silent")                       # -> SYSTEM_OFFLINE after the timeout
-        if wait(45): return
-        set_scenario("normal")
-        log("Demo finished")
-    finally:
-        with lock:
-            state["demo"] = False
-        stop_demo.clear()
+
+def send_replies(guard, electrician, guard_delay, elec_delay):
+    """Schedule the guard and electrician replies to the last alert."""
+    alert_id = state["last_alert_id"]
+    if not alert_id:
+        return False
+    for role, reply, delay in (("guard", guard, guard_delay),
+                               ("electrician", electrician, elec_delay)):
+        if not reply:
+            continue
+
+        def run(role=role, reply=reply, delay=delay):
+            time.sleep(max(0, delay))
+            resp = {"role": role, "reply": reply, "replied_at": now_iso()}
+            post(f"/api/alerts/{alert_id}/responses", resp)
+            for a in state["alerts"]:
+                if a["alert_id"] == alert_id:
+                    a["responses"].append(resp)
+            log(f"{alert_id}: {role} replied '{reply}'")
+
+        threading.Thread(target=run, daemon=True).start()
+    return True
+
+
+# ── scenarios and demo ───────────────────────────────────────────────────
+def set_scenario(name):
+    state["scenario"] = name
+    state["alerted"] = False
+    if name != "drift":
+        state["drift_value"] = DIALS["oil_temp"]["base"]
+    log(f"Scenario -> {name}")
 
 
 def start_demo():
@@ -286,7 +217,37 @@ def start_demo():
     return True
 
 
-# ───────────── control page ─────────────
+def run_demo():
+    """Full walkthrough from the demo guide, no manual action needed."""
+    def wait(seconds):                           # True if the demo was stopped
+        return stop_demo.wait(seconds)
+
+    state["demo"] = True
+    log("Demo started")
+    try:
+        set_scenario("normal")
+        if wait(20): return                      # green banner
+        set_scenario("drift")
+        if wait(50): return                      # oil temp climbs -> WATCH
+        set_scenario("limit")                    # red lamp + siren -> INTERVENE_NOW
+        while not state["alerted"]:
+            if wait(0.5): return
+        send_replies("1", "COMING", 6, 18)       # guard, then electrician
+        if wait(30): return
+        set_scenario("unreadable")
+        if wait(20): return                      # "check needed"
+        set_scenario("normal")
+        if wait(10): return
+        set_scenario("silent")
+        if wait(45): return                      # -> SYSTEM_OFFLINE after the timeout
+        set_scenario("normal")
+        log("Demo finished")
+    finally:
+        state["demo"] = False
+        stop_demo.clear()
+
+
+# ── control page ─────────────────────────────────────────────────────────
 @app.get("/")
 def index():
     return render_template("simulator.html", scenarios=SCENARIOS)
@@ -294,10 +255,10 @@ def index():
 
 @app.get("/state")
 def get_state():
-    with lock:
-        return jsonify({**state, "events": state["events"][-40:][::-1],
-                        "alerts": state["alerts"][::-1],
-                        "api_url": API_URL, "thresholds": DIALS})
+    return jsonify(scenario=state["scenario"], demo=state["demo"],
+                   send_to_api=state["send_to_api"], api_ok=state["api_ok"], api_url=API_URL,
+                   last_reading=state["last_reading"], last_alert_id=state["last_alert_id"],
+                   alerts=state["alerts"][::-1], events=state["events"][-40:][::-1])
 
 
 @app.post("/scenario")
@@ -305,8 +266,8 @@ def post_scenario():
     name = (request.get_json(silent=True) or {}).get("name")
     if name not in SCENARIOS:
         return jsonify(error="unknown scenario"), 400
-    stop_demo.set()                                  # manual control cancels a running demo
-    time.sleep(0.05)
+    stop_demo.set()                              # manual control cancels a running demo
+    time.sleep(0.05)                             # let the demo thread notice first
     set_scenario(name)
     return jsonify(ok=True)
 
@@ -314,9 +275,8 @@ def post_scenario():
 @app.post("/mode")
 def post_mode():
     on = bool((request.get_json(silent=True) or {}).get("send_to_api"))
-    with lock:
-        state["send_to_api"] = on
-        state["api_ok"] = None
+    state["send_to_api"] = on
+    state["api_ok"] = None
     log(f"Sending to API: {'ON -> ' + API_URL if on else 'OFF (standalone)'}")
     return jsonify(ok=True)
 
@@ -332,12 +292,11 @@ def post_demo():
 
 @app.post("/alert")
 def post_alert():
-    data = request.get_json(silent=True) or {}
-    level = data.get("level", "INTERVENE_NOW")
+    d = request.get_json(silent=True) or {}
+    level = d.get("level", "INTERVENE_NOW")
     if level not in ROLES_BY_LEVEL:
         return jsonify(error="unknown level"), 400
-    trigger = data.get("trigger") or f"manual test ({level})"
-    return jsonify(alert_id=create_alert(level, trigger))
+    return jsonify(alert_id=create_alert(level, d.get("trigger") or f"manual test ({level})"))
 
 
 @app.post("/replies")
@@ -346,8 +305,9 @@ def post_replies():
     guard, elec = d.get("guard") or None, d.get("electrician") or None
     if (guard and guard not in GUARD_REPLIES) or (elec and elec not in ELEC_REPLIES):
         return jsonify(error="invalid reply"), 400
-    ok = send_replies(guard, elec, float(d.get("guard_delay", 5)), float(d.get("elec_delay", 15)))
-    return (jsonify(ok=True) if ok else (jsonify(error="no alert yet — create one first"), 409))
+    if send_replies(guard, elec, float(d.get("guard_delay", 5)), float(d.get("elec_delay", 15))):
+        return jsonify(ok=True)
+    return jsonify(error="no alert yet — create one first"), 409
 
 
 if __name__ == "__main__":
@@ -357,5 +317,8 @@ if __name__ == "__main__":
         start_demo()
     elif arg in SCENARIOS:
         set_scenario(arg)
-    # use_reloader=False: the reloader would start the reading thread twice
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    elif arg:
+        sys.exit(f"unknown argument '{arg}' — expected 'demo' or one of {SCENARIOS}")
+    mode = f"sending to {API_URL}" if state["send_to_api"] else "standalone (nothing sent)"
+    print(f"Nadhir simulator · control page http://localhost:{PORT} · {mode}", flush=True)
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)  # reloader would run the loop twice
