@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nadhir · Simulator control</title>
+<style>
+  :root { --bg:#0f1419; --card:#1a2129; --line:#2b3641; --text:#e6edf3; --muted:#8b98a5;
+          --green:#2ea043; --yellow:#d29922; --red:#da3633; --grey:#6e7681; --blue:#388bfd; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.4 system-ui,sans-serif; background:var(--bg); color:var(--text); padding:16px;
+         max-width:1000px; margin-inline:auto; }
+  h1 { font-size:18px; margin:0 0 12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:0 0 10px; }
+  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .pill { font-size:12px; padding:2px 10px; border-radius:99px; background:var(--grey); color:#fff; }
+  .pill.ok { background:var(--green); } .pill.bad { background:var(--red); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px; }
+  button, select, input { font:inherit; color:var(--text); background:#232d38; border:1px solid var(--line);
+          border-radius:8px; padding:8px 12px; }
+  button { cursor:pointer; } button:hover { border-color:var(--blue); }
+  button.active { background:var(--blue); border-color:var(--blue); color:#fff; }
+  button.danger { border-color:var(--red); } button.go { border-color:var(--green); }
+  input[type=number] { width:70px; }
+  label { color:var(--muted); font-size:13px; }
+  .dial { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--line); }
+  .dial:last-child { border:0; }
+  .tag { font-size:11px; padding:1px 7px; border-radius:6px; background:var(--grey); margin-left:6px; }
+  .tag.OK { background:var(--green); } .tag.UNCERTAIN { background:var(--yellow); } .tag.REJECTED { background:var(--red); }
+  .banner { padding:10px; border-radius:8px; text-align:center; font-weight:700; margin-bottom:10px; }
+  .NORMAL { background:var(--green); } .WATCH { background:var(--yellow); color:#111; }
+  .INTERVENE_NOW { background:var(--red); } .SYSTEM_OFFLINE { background:var(--grey); }
+  #events { max-height:280px; overflow:auto; font:13px/1.5 ui-monospace,monospace; }
+  #events div { border-bottom:1px solid var(--line); padding:3px 0; }
+  #events span { color:var(--muted); margin-right:8px; }
+  .muted { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<h1>Nadhir · Simulator
+  <span class="pill" id="api">API: …</span>
+  <span class="pill" id="demo" hidden>DEMO RUNNING</span>
+</h1>
+
+<div class="grid">
+  <div class="card">
+    <h2>Scenario (what the box sends)</h2>
+    <div class="row" id="scenarios"></div>
+    <div class="row">
+      <button class="go" onclick="demo('start')">▶ Play full demo</button>
+      <button onclick="demo('stop')">■ Stop demo</button>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="send" onchange="api('/mode',{send_to_api:this.checked})"> Send to API</label>
+    </div>
+    <p class="muted">Clicking a scenario cancels a running demo. “silent” stops all readings, so the dashboard should go SYSTEM_OFFLINE after its timeout.</p>
+  </div>
+
+  <div class="card">
+    <h2>Trigger an alert now</h2>
+    <div class="row">
+      <button onclick="alertNow('WATCH')">WATCH</button>
+      <button class="danger" onclick="alertNow('INTERVENE_NOW')">INTERVENE_NOW</button>
+      <button onclick="alertNow('SYSTEM_OFFLINE')">SYSTEM_OFFLINE</button>
+    </div>
+    <h2 style="margin-top:14px">Replies to the last alert <span id="lastAlert" class="tag">none</span></h2>
+    <div class="row">
+      <label>Guard</label>
+      <select id="guard"><option value="1">1</option><option value="2">2</option><option value="">(none)</option></select>
+      <label>after</label><input type="number" id="gd" value="5" min="0"><label>s</label>
+    </div>
+    <div class="row">
+      <label>Electrician</label>
+      <select id="elec"><option>COMING</option><option>WATCH</option><option>FALSE ALARM</option><option value="">(none)</option></select>
+      <label>after</label><input type="number" id="ed" value="15" min="0"><label>s</label>
+    </div>
+    <button class="go" onclick="sendReplies()">Send replies</button>
+    <span id="msg" class="muted"></span>
+  </div>
+
+  <div class="card">
+    <h2>Last reading sent</h2>
+    <div id="banner" class="banner">–</div>
+    <div id="dials"></div>
+    <p class="muted" id="lamps"></p>
+    <p class="muted" id="ts"></p>
+  </div>
+
+  <div class="card">
+    <h2>Alerts (local)</h2>
+    <div id="alerts" class="muted">none yet</div>
+  </div>
+
+  <div class="card">
+    <h2>Event log</h2>
+    <div id="events"></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const SCENARIOS = {{ scenarios|tojson }};
+
+async function api(url, body = {}) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  return {status:r.status, data: await r.json()};
+}
+const setScenario = name => api('/scenario', {name});
+const demo = action => api('/demo', {action});
+const alertNow = level => api('/alert', {level});
+async function sendReplies() {
+  const r = await api('/replies', {guard:$('#guard').value, electrician:$('#elec').value,
+                                   guard_delay:$('#gd').value, elec_delay:$('#ed').value});
+  $('#msg').textContent = r.status === 200 ? ' sent ✓' : ' ' + (r.data.error || 'error');
+  setTimeout(() => $('#msg').textContent = '', 3000);
+}
+
+// buttons are built once, then only their "active" class changes
+SCENARIOS.forEach(n => {
+  const b = document.createElement('button');
+  b.textContent = n; b.dataset.name = n; b.onclick = () => setScenario(n);
+  $('#scenarios').appendChild(b);
+});
+
+async function refresh() {
+  let s;
+  try { s = await (await fetch('/state')).json(); } catch { return; }
+
+  document.querySelectorAll('#scenarios button').forEach(b =>
+    b.classList.toggle('active', b.dataset.name === s.scenario));
+  const pill = $('#api');
+  pill.textContent = !s.send_to_api ? 'Standalone (not sending)'
+    : 'API: ' + (s.api_ok === null ? 'no call yet' : s.api_ok ? 'connected' : 'unreachable') + ' · ' + s.api_url;
+  pill.className = 'pill ' + (!s.send_to_api ? '' : s.api_ok ? 'ok' : s.api_ok === false ? 'bad' : '');
+  $('#send').checked = s.send_to_api;
+  $('#demo').hidden = !s.demo;
+  $('#lastAlert').textContent = s.last_alert_id || 'none';
+
+  const r = s.last_reading;
+  if (r) {
+    $('#banner').textContent = r.system_state;
+    $('#banner').className = 'banner ' + r.system_state;
+    $('#dials').replaceChildren(...r.dials.map(d => {
+      const row = document.createElement('div'); row.className = 'dial';
+      const val = d.value === null ? d.message : `${d.value} ${d.unit}`;
+      row.innerHTML = `<span>${d.dial_id}<span class="tag ${d.status}">${d.status}</span></span><b></b>`;
+      row.querySelector('b').textContent = val;
+      return row;
+    }));
+    $('#lamps').textContent = 'Lamps: ' + r.lamps.map(l => `${l.lamp_id}=${l.state}`).join(' · ')
+                            + ' | Siren: ' + (r.siren.detected ? 'DETECTED' : 'off');
+    $('#ts').textContent = 'Sent at ' + r.timestamp;
+  }
+  if (s.alerts.length) $('#alerts').replaceChildren(...s.alerts.map(a => {
+    const d = document.createElement('div'); d.className = 'dial'; d.style.display = 'block';
+    const replies = a.responses.map(x => `${x.role}: ${x.reply} (${x.replied_at.slice(11,19)})`).join(' → ') || 'no reply yet';
+    d.textContent = `${a.alert_id} · ${a.level} · ${a.created_at.slice(11,19)} — ${a.trigger} — ${replies}`;
+    return d;
+  }));
+  $('#events').replaceChildren(...s.events.map(e => {
+    const d = document.createElement('div');
+    const t = document.createElement('span'); t.textContent = e.t.slice(11, 19);
+    d.append(t, e.msg);
+    return d;
+  }));
+}
+setInterval(refresh, 1000); refresh();
+</script>
+</body>
+</html>
